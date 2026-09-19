@@ -1,30 +1,51 @@
 import os
 import json
 import requests
+from pathlib import Path
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION FROM ENVIRONMENT
+# PATHS & CACHE CONFIGURATION
+# ---------------------------------------------------------------------------
+CACHE_DIR = Path(".cache")
+STATE_FILE = CACHE_DIR / "state.json"
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT VARIABLES & DEFAULTS
 # ---------------------------------------------------------------------------
 NTFY_TOPIC = os.getenv("NTFY_TOPIC")
-TARGET_START_YEAR = int(os.getenv("TARGET_START_YEAR", "2026"))
-TARGET_START_MONTH = int(os.getenv("TARGET_START_MONTH", "10"))
 
-# Expected format: YYYY-MM-DD
+min_start_raw = os.getenv("MIN_START_DATE", "2026-10-01")
+MIN_START_DATE = datetime.strptime(min_start_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+max_start_raw = os.getenv("MAX_START_DATE")
+MAX_START_DATE = (
+    datetime.strptime(max_start_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    if max_start_raw
+    else None
+)
+
 max_end_raw = os.getenv("MAX_END_DATE", "2027-03-01")
 MAX_END_DATE = datetime.strptime(max_end_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
 EXCLUDE_SPECIALIZED = os.getenv("EXCLUDE_SPECIALIZED", "true").lower() == "true"
 SPECIALIZED_KEYWORDS = [
-    "frühpädagogik", "heilberufe", "humanmedizin", 
-    "apotheker", "pharmazie", "erzieher", "kita"
+    "frühpädagogik",
+    "heilberufe",
+    "humanmedizin",
+    "apotheker",
+    "pharmazie",
+    "erzieher",
+    "kita",
 ]
 
-STATE_FILE = "notified_termine.json"
+# ---------------------------------------------------------------------------
+# API CONSTANTS
+# ---------------------------------------------------------------------------
 API_URL = "https://rest.arbeitsagentur.de/infosysbub/sprachfoerderung/pc/v1/bildungsangebot"
 PARAMS = {
     "systematiken": "MC",
-    "sprachniveaus": "MC 01 4",
+    "sprachniveaus": "MC 01 4",  # C1 level
     "umkreis": "Bundesweit",
     "sort": "basc",
     "size": 50,
@@ -32,11 +53,11 @@ PARAMS = {
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36",
     "Accept": "application/json",
-    "X-API-Key": "sprachfoerderung-suche"
+    "X-API-Key": "sprachfoerderung-suche",
 }
 
 # ---------------------------------------------------------------------------
-# FILTER LOGIC
+# HELPER FUNCTIONS
 # ---------------------------------------------------------------------------
 def ms_to_datetime(ms):
     if not ms:
@@ -46,32 +67,40 @@ def ms_to_datetime(ms):
 def is_specialized_course(termin):
     angebot = termin.get("angebot", {})
     titel = angebot.get("titel", "").lower()
-    
+
     if any(keyword in titel for keyword in SPECIALIZED_KEYWORDS):
         return True
-        
+
+    # BAMF codes: MC 02 = Fachspezifisch, MC 03 = Anerkennung Heilberufe
     for syst in angebot.get("systematiken", []):
         if syst.get("codeNr") in ["MC 02", "MC 03"]:
             return True
-            
+
     return False
 
 def evaluate_termin(termin):
     """
+    Evaluates an offering against user-defined filters.
     Returns (status, reason):
-    status in ['MATCH', 'SPECIALIZED', 'BAD_START', 'BAD_END', 'BAD_LOCATION_FORMAT']
+      status in ['MATCH', 'SPECIALIZED', 'BAD_START', 'BAD_END', 'BAD_LOCATION_FORMAT']
     """
     if EXCLUDE_SPECIALIZED and is_specialized_course(termin):
         return "SPECIALIZED", "Fachspezifischer Kurs (Frühpädagogik/Medizin/etc.)"
 
+    # 1. Start Date Check
     start_dt = ms_to_datetime(termin.get("beginn"))
-    if not start_dt or start_dt.year != TARGET_START_YEAR or start_dt.month != TARGET_START_MONTH:
-        return "BAD_START", f"Start {start_dt.strftime('%m/%Y') if start_dt else 'N/A'} != {TARGET_START_MONTH:02d}/{TARGET_START_YEAR}"
+    if not start_dt or start_dt < MIN_START_DATE:
+        return "BAD_START", f"Start {start_dt.strftime('%d.%m.%Y') if start_dt else 'N/A'} < {MIN_START_DATE.strftime('%d.%m.%Y')}"
 
+    if MAX_START_DATE and start_dt > MAX_START_DATE:
+        return "BAD_START", f"Start {start_dt.strftime('%d.%m.%Y')} > {MAX_START_DATE.strftime('%d.%m.%Y')}"
+
+    # 2. End Date Check
     end_dt = ms_to_datetime(termin.get("ende"))
     if not end_dt or end_dt >= MAX_END_DATE:
         return "BAD_END", f"Ende {end_dt.strftime('%d.%m.%Y') if end_dt else 'N/A'} >= {MAX_END_DATE.strftime('%d.%m.%Y')}"
 
+    # 3. Location & Format Check
     adresse = termin.get("adresse", {})
     ort_info = adresse.get("ortStrasse", {})
     city = ort_info.get("name", "")
@@ -82,6 +111,7 @@ def evaluate_termin(termin):
     titel = termin.get("angebot", {}).get("titel", "").lower()
     zeiten = (termin.get("unterrichtszeiten") or "").lower()
 
+    # Form ID 5 corresponds to E-Learning / Virtuelles Klassenzimmer
     is_virtual_form = (form_id == 5)
     is_hybrid_in_person = ("teilweise virtuell" in titel) or ("in präsenz" in zeiten and not is_berlin)
     is_pure_virtual = is_virtual_form and not is_hybrid_in_person
@@ -93,18 +123,22 @@ def evaluate_termin(termin):
 
 def send_ntfy_notification(termin):
     if not NTFY_TOPIC:
-        print("[NTFY] Skipped: NTFY_TOPIC is not configured.")
+        print("[NTFY] Skipped: NTFY_TOPIC environment variable is not set.")
         return
 
     angebot = termin.get("angebot", {})
     provider = angebot.get("bildungsanbieter", {}).get("name", "Unbekannter Anbieter")
     title = angebot.get("titel", "Berufssprachkurs C1")
-    
+
     start_str = ms_to_datetime(termin.get("beginn")).strftime("%d.%m.%Y")
     end_str = ms_to_datetime(termin.get("ende")).strftime("%d.%m.%Y")
     city = termin.get("adresse", {}).get("ortStrasse", {}).get("name", "Online")
     contact_email = angebot.get("bildungsanbieter", {}).get("email") or "N/A"
-    course_url = termin.get("link") or angebot.get("link") or "https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse"
+    course_url = (
+        termin.get("link")
+        or angebot.get("link")
+        or "https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse"
+    )
 
     message = (
         f"Schule: {provider}\n"
@@ -120,13 +154,13 @@ def send_ntfy_notification(termin):
         "message": message,
         "priority": 4,
         "tags": ["mortar_board", "calendar"],
-        "click": course_url
+        "click": course_url,
     }
 
     try:
         resp = requests.post("https://ntfy.sh", json=payload, timeout=10)
         resp.raise_for_status()
-        print(f"[NTFY] Alert sent for termin ID {termin.get('id')}")
+        print(f"[NTFY] Notification successfully dispatched for termin ID {termin.get('id')}")
     except Exception as e:
         print(f"[ERROR] Failed to send NTFY notification: {e}")
 
@@ -135,19 +169,24 @@ def write_github_summary(stats, newly_matched_items):
     if not summary_path:
         return
 
-    markdown = []
-    markdown.append("## C1 Berufssprachkurs Checker Summary\n")
-    markdown.append(f"**Target Window:** Starts `{TARGET_START_MONTH:02d}/{TARGET_START_YEAR}` | Ends before `{MAX_END_DATE.strftime('%d.%m.%Y')}`\n")
-    
-    markdown.append("| Metric | Count |")
-    markdown.append("| :--- | :--- |")
-    markdown.append(f"| Total Termine Evaluated | **{stats['total']}** |")
-    markdown.append(f"| Excluded: Specialized Courses (Frühpädagogik/Medizin) | {stats['specialized']} |")
-    markdown.append(f"| Excluded: Start Date Mismatch (Not Oct 2026) | {stats['bad_start']} |")
-    markdown.append(f"| Excluded: End Date Mismatch (>= March 2027) | {stats['bad_end']} |")
-    markdown.append(f"| Excluded: Format/Location Mismatch | {stats['bad_location_format']} |")
-    markdown.append(f"| Already Notified (Previous Runs) | {stats['already_notified']} |")
-    markdown.append(f"| **New Matching Courses Notified** | **{stats['new_matches']}** |\n")
+    date_range_str = f"Starts on/after `{MIN_START_DATE.strftime('%d.%m.%Y')}`"
+    if MAX_START_DATE:
+        date_range_str += f" and on/before `{MAX_START_DATE.strftime('%d.%m.%Y')}`"
+    date_range_str += f" | Ends before `{MAX_END_DATE.strftime('%d.%m.%Y')}`"
+
+    markdown = [
+        "## C1 Berufssprachkurs Checker Summary\n",
+        f"**Target Window:** {date_range_str}\n",
+        "| Metric | Count |",
+        "| :--- | :--- |",
+        f"| Total Termine Evaluated | **{stats['total']}** |",
+        f"| Excluded: Specialized (Frühpädagogik/Medizin/etc.) | {stats['specialized']} |",
+        f"| Excluded: Start Date Mismatch | {stats['bad_start']} |",
+        f"| Excluded: End Date Mismatch (>= Max End) | {stats['bad_end']} |",
+        f"| Excluded: Format/Location Mismatch | {stats['bad_location_format']} |",
+        f"| Already Notified (Cached) | {stats['already_notified']} |",
+        f"| **New Matching Courses Notified** | **{stats['new_matches']}** |\n",
+    ]
 
     if newly_matched_items:
         markdown.append("### Newly Found & Notified Courses\n")
@@ -156,20 +195,22 @@ def write_github_summary(stats, newly_matched_items):
         for item in newly_matched_items:
             markdown.append(
                 f"| `{item['id']}` | {item['provider']} | {item['city']} | "
-                f"{item['start']} - {item['end']} | {item['title']} | [Course Link]({item['link']}) |"
+                f"{item['start']} - {item['end']} | {item['title']} | [Open Link]({item['link']}) |"
             )
     else:
-        markdown.append("> *No new matching course offerings found in this run.*\n")
+        markdown.append("> *No new matching course offerings detected in this run.*\n")
 
     with open(summary_path, "a", encoding="utf-8") as f:
         f.write("\n".join(markdown) + "\n")
 
 # ---------------------------------------------------------------------------
-# MAIN EXECUTION
+# MAIN SCRIPT EXECUTION
 # ---------------------------------------------------------------------------
 def main():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
     notified_ids = set()
-    if os.path.exists(STATE_FILE):
+    if STATE_FILE.exists():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             try:
                 notified_ids = set(json.load(f))
@@ -189,9 +230,11 @@ def main():
     newly_matched_items = []
     page = 0
 
+    print("Fetching C1 Berufssprachkurs offerings from Arbeitsagentur API...")
+
     while True:
-        p = {**PARAMS, "page": page}
-        resp = requests.get(API_URL, params=p, headers=HEADERS, timeout=25)
+        params = {**PARAMS, "page": page}
+        resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=25)
         if resp.status_code != 200:
             print(f"Fetch failed on page {page}: HTTP {resp.status_code}")
             break
@@ -221,7 +264,7 @@ def main():
                     stats["new_matches"] += 1
                     send_ntfy_notification(t)
                     notified_ids.add(termin_id)
-                    
+
                     angebot = t.get("angebot", {})
                     newly_matched_items.append({
                         "id": termin_id,
@@ -230,22 +273,29 @@ def main():
                         "start": ms_to_datetime(t.get("beginn")).strftime("%d.%m.%Y"),
                         "end": ms_to_datetime(t.get("ende")).strftime("%d.%m.%Y"),
                         "title": angebot.get("titel", "N/A"),
-                        "link": t.get("link") or angebot.get("link") or "https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse"
+                        "link": (
+                            t.get("link")
+                            or angebot.get("link")
+                            or "https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse"
+                        ),
                     })
 
         page_info = data.get("page", {})
-        if page >= page_info.get("totalPages", 1) - 1:
+        total_pages = page_info.get("totalPages", 1)
+        if page >= total_pages - 1:
             break
         page += 1
 
-    # Update state file
+    print(f"Scan complete. Evaluated: {stats['total']}, New notifications: {stats['new_matches']}.")
+
+    # Persist state back to .cache/state.json
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(list(notified_ids)), f, indent=2)
 
-    # Render GitHub Summary
+    # Render summary table in GitHub Actions UI
     write_github_summary(stats, newly_matched_items)
 
-    # Set workflow output
+    # Export output flag for actions/cache step condition
     if "GITHUB_OUTPUT" in os.environ:
         with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
             gh_out.write(f"new_courses_notified={str(bool(newly_matched_items)).lower()}\n")
