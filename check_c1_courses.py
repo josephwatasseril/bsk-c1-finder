@@ -2,11 +2,13 @@ import os
 import json
 import requests
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
-# PATHS & CACHE CONFIGURATION
+# TIMEZONE & PATH CONFIGURATION
 # ---------------------------------------------------------------------------
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
 CACHE_DIR = Path(".cache")
 STATE_FILE = CACHE_DIR / "state.json"
 
@@ -17,17 +19,17 @@ NTFY_TOPIC = os.getenv("NTFY_TOPIC")
 BA_API_KEY = os.getenv("BA_API_KEY")
 
 min_start_raw = os.getenv("MIN_START_DATE", "2026-10-01")
-MIN_START_DATE = datetime.strptime(min_start_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+MIN_START_DATE = datetime.strptime(min_start_raw, "%Y-%m-%d").date()
 
 max_start_raw = os.getenv("MAX_START_DATE")
 MAX_START_DATE = (
-    datetime.strptime(max_start_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    datetime.strptime(max_start_raw, "%Y-%m-%d").date()
     if max_start_raw
     else None
 )
 
 max_end_raw = os.getenv("MAX_END_DATE", "2027-03-01")
-MAX_END_DATE = datetime.strptime(max_end_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+MAX_END_DATE = datetime.strptime(max_end_raw, "%Y-%m-%d").date()
 
 EXCLUDE_SPECIALIZED = os.getenv("EXCLUDE_SPECIALIZED", "true").lower() == "true"
 SPECIALIZED_KEYWORDS = [
@@ -41,8 +43,29 @@ SPECIALIZED_KEYWORDS = [
 ]
 
 # ---------------------------------------------------------------------------
-# EXACT CURL HEADERS
+# SEARCH CONFIGURATIONS
 # ---------------------------------------------------------------------------
+SEARCH_TARGETS = [
+    {
+        "name": "Berlin & Umgebung (50km)",
+        "category": "Berlin (50km)",
+        "url_template": (
+            "https://rest.arbeitsagentur.de/infosysbub/sprachfoerderung/pc/v1/bildungsangebot"
+            "?systematiken=MC&page={page}&umkreis=50&orte=Berlin_13.4056_52.5178&sort=basc&sprachniveaus=MC%2001%204"
+        ),
+        "allow_in_person": True,
+    },
+    {
+        "name": "Virtuell (Bundesweit)",
+        "category": "Virtuell (Bundesweit)",
+        "url_template": (
+            "https://rest.arbeitsagentur.de/infosysbub/sprachfoerderung/pc/v1/bildungsangebot"
+            "?systematiken=MC&page={page}&umkreis=Bundesweit&sort=basc&sprachniveaus=MC%2001%204"
+        ),
+        "allow_in_person": False,
+    },
+]
+
 HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "en-US,en;q=0.7",
@@ -63,10 +86,20 @@ HEADERS = {
 # ---------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # ---------------------------------------------------------------------------
-def ms_to_datetime(ms):
+def ms_to_berlin_datetime(ms):
+    """Converts epoch milliseconds to Europe/Berlin localized datetime."""
     if not ms:
         return None
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    return datetime.fromtimestamp(ms / 1000.0, tz=BERLIN_TZ)
+
+def get_angebot_id(termin):
+    """Extracts the catalog Angebot ID from the nested offering structure."""
+    angebot = termin.get("angebot", {})
+    return str(angebot.get("id") or termin.get("id"))
+
+def build_angebot_url(termin):
+    angebot_id = get_angebot_id(termin)
+    return f"https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse/angebot/{angebot_id}"
 
 def is_specialized_course(termin):
     angebot = termin.get("angebot", {})
@@ -81,71 +114,60 @@ def is_specialized_course(termin):
 
     return False
 
-def evaluate_termin(termin):
+def evaluate_termin(termin, allow_in_person: bool):
     """
-    Evaluates an offering against user-defined filters.
+    Evaluates an offering against filters.
     Returns (status, reason):
-      status in ['MATCH', 'SPECIALIZED', 'BAD_START', 'BAD_END', 'BAD_LOCATION_FORMAT']
+      status in ['MATCH', 'SPECIALIZED', 'BAD_START', 'BAD_END', 'BAD_FORMAT']
     """
     if EXCLUDE_SPECIALIZED and is_specialized_course(termin):
         return "SPECIALIZED", "Fachspezifischer Kurs (Frühpädagogik/Medizin/etc.)"
 
-    # 1. Start Date Check
-    start_dt = ms_to_datetime(termin.get("beginn"))
-    if not start_dt or start_dt < MIN_START_DATE:
+    start_dt = ms_to_berlin_datetime(termin.get("beginn"))
+    if not start_dt or start_dt.date() < MIN_START_DATE:
         return "BAD_START", f"Start {start_dt.strftime('%d.%m.%Y') if start_dt else 'N/A'} < {MIN_START_DATE.strftime('%d.%m.%Y')}"
 
-    if MAX_START_DATE and start_dt > MAX_START_DATE:
+    if MAX_START_DATE and start_dt.date() > MAX_START_DATE:
         return "BAD_START", f"Start {start_dt.strftime('%d.%m.%Y')} > {MAX_START_DATE.strftime('%d.%m.%Y')}"
 
-    # 2. End Date Check
-    end_dt = ms_to_datetime(termin.get("ende"))
-    if not end_dt or end_dt >= MAX_END_DATE:
+    end_dt = ms_to_berlin_datetime(termin.get("ende"))
+    if not end_dt or end_dt.date() >= MAX_END_DATE:
         return "BAD_END", f"Ende {end_dt.strftime('%d.%m.%Y') if end_dt else 'N/A'} >= {MAX_END_DATE.strftime('%d.%m.%Y')}"
 
-    # 3. Location & Delivery Format Check
-    adresse = termin.get("adresse", {})
-    ort_info = adresse.get("ortStrasse", {})
-    city = ort_info.get("name", "")
-    bundesland = ort_info.get("land", {}).get("bundeslandCode", "")
-    is_berlin = (city == "Berlin" or bundesland == "BER")
+    if not allow_in_person:
+        form_id = termin.get("unterrichtsform", {}).get("id")
+        titel = termin.get("angebot", {}).get("titel", "").lower()
+        zeiten = (termin.get("unterrichtszeiten") or "").lower()
 
-    form_id = termin.get("unterrichtsform", {}).get("id")
-    titel = termin.get("angebot", {}).get("titel", "").lower()
-    zeiten = (termin.get("unterrichtszeiten") or "").lower()
-
-    # Form ID 5 is E-Learning / Virtuelles Klassenzimmer
-    is_virtual_form = (form_id == 5)
-    is_hybrid_in_person = ("teilweise virtuell" in titel) or ("in präsenz" in zeiten and not is_berlin)
-    is_pure_virtual = is_virtual_form and not is_hybrid_in_person
-
-    if not (is_berlin or is_pure_virtual):
-        return "BAD_LOCATION_FORMAT", "Weder Berlin noch 100% virtuell"
+        is_virtual_form = (form_id == 5)
+        is_hybrid_in_person = ("teilweise virtuell" in titel) or ("in präsenz" in zeiten)
+        if not (is_virtual_form and not is_hybrid_in_person):
+            return "BAD_FORMAT", "Präsenz- oder Hybridkurs außerhalb Berlins"
 
     return "MATCH", "Kriterien erfüllt"
 
-def send_ntfy_notification(termin):
+def send_ntfy_notification(termin, category):
     if not NTFY_TOPIC:
         print("[NTFY] Skipped: NTFY_TOPIC environment variable is not configured.")
         return
 
     angebot = termin.get("angebot", {})
+    angebot_id = get_angebot_id(termin)
     provider = angebot.get("bildungsanbieter", {}).get("name", "Unbekannter Anbieter")
     title = angebot.get("titel", "Berufssprachkurs C1")
 
-    start_str = ms_to_datetime(termin.get("beginn")).strftime("%d.%m.%Y")
-    end_str = ms_to_datetime(termin.get("ende")).strftime("%d.%m.%Y")
-    city = termin.get("adresse", {}).get("ortStrasse", {}).get("name", "Online")
+    start_str = ms_to_berlin_datetime(termin.get("beginn")).strftime("%d.%m.%Y")
+    end_str = ms_to_berlin_datetime(termin.get("ende")).strftime("%d.%m.%Y")
+    city = termin.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A")
+    form_label = termin.get("unterrichtsform", {}).get("bezeichnung", "N/A")
     contact_email = angebot.get("bildungsanbieter", {}).get("email") or "N/A"
-    course_url = (
-        termin.get("link")
-        or angebot.get("link")
-        or "https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse"
-    )
+    course_url = build_angebot_url(termin)
 
     message = (
+        f"Kategorie: {category}\n"
+        f"Angebot ID: {angebot_id}\n"
         f"Schule: {provider}\n"
-        f"Ort: {city}\n"
+        f"Ort: {city} ({form_label})\n"
         f"Laufzeit: {start_str} - {end_str}\n"
         f"Kontakt: {contact_email}\n\n"
         f"Titel: {title}"
@@ -153,7 +175,7 @@ def send_ntfy_notification(termin):
 
     payload = {
         "topic": NTFY_TOPIC,
-        "title": f"C1 BSK Gefunden: {city} ({start_str})",
+        "title": f"C1 BSK [{category}]: {city} ({start_str})",
         "message": message,
         "priority": 4,
         "tags": ["mortar_board", "calendar"],
@@ -163,7 +185,7 @@ def send_ntfy_notification(termin):
     try:
         resp = requests.post("https://ntfy.sh", json=payload, timeout=10)
         resp.raise_for_status()
-        print(f"[NTFY] Notification sent for termin ID {termin.get('id')}")
+        print(f"[NTFY] Notification sent for Angebot ID {angebot_id} ({category})")
     except Exception as e:
         print(f"[ERROR] Failed to send NTFY notification: {e}")
 
@@ -182,23 +204,25 @@ def write_github_summary(stats, newly_matched_items):
         f"**Target Window:** {date_range_str}\n",
         "| Metric | Count |",
         "| :--- | :--- |",
-        f"| Total Termine Evaluated | **{stats['total']}** |",
-        f"| Excluded: Specialized (Frühpädagogik/Medizin) | {stats['specialized']} |",
+        f"| Total Unique Termine Evaluated | **{stats['total']}** |",
+        f"| Excluded: Specialized (Frühpädagogik/Medizin/etc.) | {stats['specialized']} |",
         f"| Excluded: Start Date Mismatch | {stats['bad_start']} |",
         f"| Excluded: End Date Mismatch (>= Max End) | {stats['bad_end']} |",
-        f"| Excluded: Format/Location Mismatch | {stats['bad_location_format']} |",
+        f"| Excluded: Non-Virtual Outside Berlin | {stats['bad_format']} |",
         f"| Already Notified (Cached) | {stats['already_notified']} |",
-        f"| **New Matching Courses Notified** | **{stats['new_matches']}** |\n",
+        f"| **New Matches: Berlin & Umgebung (50km)** | **{stats['new_berlin']}** |",
+        f"| **New Matches: Virtuell (Bundesweit)** | **{stats['new_virtual']}** |",
+        f"| **Total New Courses Notified** | **{stats['new_berlin'] + stats['new_virtual']}** |\n",
     ]
 
     if newly_matched_items:
         markdown.append("### Newly Found & Notified Courses\n")
-        markdown.append("| ID | Provider | Location | Duration | Title | Link |")
-        markdown.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        markdown.append("| Angebot ID | Category | Provider | Location | Format | Duration | Title | Link |")
+        markdown.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
         for item in newly_matched_items:
             markdown.append(
-                f"| `{item['id']}` | {item['provider']} | {item['city']} | "
-                f"{item['start']} - {item['end']} | {item['title']} | [Open Link]({item['link']}) |"
+                f"| `{item['angebot_id']}` | **{item['category']}** | {item['provider']} | {item['city']} | "
+                f"{item['form']} | {item['start']} - {item['end']} | {item['title']} | [Open Angebot]({item['link']}) |"
             )
     else:
         markdown.append("> *No new matching course offerings found in this run.*\n")
@@ -225,77 +249,88 @@ def main():
         "specialized": 0,
         "bad_start": 0,
         "bad_end": 0,
-        "bad_location_format": 0,
+        "bad_format": 0,
         "already_notified": 0,
-        "new_matches": 0,
+        "new_berlin": 0,
+        "new_virtual": 0,
     }
 
+    evaluated_in_run = set()
     newly_matched_items = []
-    page = 0
 
-    print("Fetching C1 offerings with exact parameters...")
+    for target in SEARCH_TARGETS:
+        print(f"Scanning search query: {target['name']}...")
+        page = 0
 
-    while True:
-        # Construct the URL exactly matching the curl query string
-        url = (
-            f"https://rest.arbeitsagentur.de/infosysbub/sprachfoerderung/pc/v1/bildungsangebot"
-            f"?systematiken=MC&page={page}&umkreis=Bundesweit&sort=basc&sprachniveaus=MC%2001%204"
-        )
+        while True:
+            url = target["url_template"].format(page=page)
+            resp = requests.get(url, headers=HEADERS, timeout=25)
 
-        resp = requests.get(url, headers=HEADERS, timeout=25)
-        if resp.status_code != 200:
-            print(f"Fetch failed on page {page}: HTTP {resp.status_code}")
-            print(f"Server response body: {resp.text}")
-            break
+            if resp.status_code != 200:
+                print(f"Fetch failed on page {page} for {target['name']}: HTTP {resp.status_code}")
+                print(f"Server response body: {resp.text}")
+                break
 
-        data = resp.json()
-        termine = data.get("_embedded", {}).get("termine", [])
-        if not termine:
-            break
+            data = resp.json()
+            termine = data.get("_embedded", {}).get("termine", [])
+            if not termine:
+                break
 
-        for t in termine:
-            stats["total"] += 1
-            status, _ = evaluate_termin(t)
-
-            if status == "SPECIALIZED":
-                stats["specialized"] += 1
-            elif status == "BAD_START":
-                stats["bad_start"] += 1
-            elif status == "BAD_END":
-                stats["bad_end"] += 1
-            elif status == "BAD_LOCATION_FORMAT":
-                stats["bad_location_format"] += 1
-            elif status == "MATCH":
+            for t in termine:
                 termin_id = str(t.get("id"))
-                if termin_id in notified_ids:
-                    stats["already_notified"] += 1
-                else:
-                    stats["new_matches"] += 1
-                    send_ntfy_notification(t)
-                    notified_ids.add(termin_id)
+                angebot_id = get_angebot_id(t)
 
-                    angebot = t.get("angebot", {})
-                    newly_matched_items.append({
-                        "id": termin_id,
-                        "provider": angebot.get("bildungsanbieter", {}).get("name", "N/A"),
-                        "city": t.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A"),
-                        "start": ms_to_datetime(t.get("beginn")).strftime("%d.%m.%Y"),
-                        "end": ms_to_datetime(t.get("ende")).strftime("%d.%m.%Y"),
-                        "title": angebot.get("titel", "N/A"),
-                        "link": (
-                            t.get("link")
-                            or angebot.get("link")
-                            or "https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse"
-                        ),
-                    })
+                # Avoid re-evaluating duplicate intakes returned across both queries in a single run
+                if termin_id in evaluated_in_run:
+                    continue
+                evaluated_in_run.add(termin_id)
+                stats["total"] += 1
 
-        page_info = data.get("page", {})
-        total_pages = page_info.get("totalPages", 1)
-        if page >= total_pages - 1:
-            break
-        page += 1
+                status, _ = evaluate_termin(t, allow_in_person=target["allow_in_person"])
 
-    print(f"Scan complete. Evaluated: {stats['total']}, New notifications: {stats['new_matches']}.")
+                if status == "SPECIALIZED":
+                    stats["specialized"] += 1
+                elif status == "BAD_START":
+                    stats["bad_start"] += 1
+                elif status == "BAD_END":
+                    stats["bad_end"] += 1
+                elif status == "BAD_FORMAT":
+                    stats["bad_format"] += 1
+                elif status == "MATCH":
+                    # Check against the cache using the catalog Angebot ID
+                    if angebot_id in notified_ids:
+                        stats["already_notified"] += 1
+                    else:
+                        category = target["category"]
+                        if category == "Berlin (50km)":
+                            stats["new_berlin"] += 1
+                        else:
+                            stats["new_virtual"] += 1
+
+                        send_ntfy_notification(t, category)
+                        notified_ids.add(angebot_id)
+
+                        angebot = t.get("angebot", {})
+                        newly_matched_items.append({
+                            "angebot_id": angebot_id,
+                            "category": category,
+                            "provider": angebot.get("bildungsanbieter", {}).get("name", "N/A"),
+                            "city": t.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A"),
+                            "form": t.get("unterrichtsform", {}).get("bezeichnung", "N/A"),
+                            "start": ms_to_berlin_datetime(t.get("beginn")).strftime("%d.%m.%Y"),
+                            "end": ms_to_berlin_datetime(t.get("ende")).strftime("%d.%m.%Y"),
+                            "title": angebot.get("titel", "N/A"),
+                            "link": build_angebot_url(t),
+                        })
+
+            page_info = data.get("page", {})
+            total_pages = page_info.get("totalPages", 1)
+            if page >= total_pages - 1:
+                break
+            page += 1
+
+    total_new = stats["new_berlin"] + stats["new_virtual"]
+    print(f"Scan complete. Evaluated: {stats['total']}, New alerts dispatched: {total_new}.")
 
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(list(notified_ids)), f, indent=2)
