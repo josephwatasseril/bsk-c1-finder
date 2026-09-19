@@ -1,0 +1,84 @@
+name: Monitor C1 BSK Courses
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_start_date:
+        description: 'Override Earliest Start Date (YYYY-MM-DD)'
+        required: false
+      max_end_date:
+        description: 'Override Latest End Date (YYYY-MM-DD)'
+        required: false
+
+jobs:
+  run-watcher:
+    runs-on: ubuntu-latest
+
+    env:
+      MIN_START_DATE: ${{ inputs.min_start_date || vars.MIN_START_DATE }}
+      MAX_END_DATE: ${{ inputs.max_end_date || vars.MAX_END_DATE }}
+      EXCLUDE_SPECIALIZED: 'true'
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python Packages
+        run: pip install requests
+
+      # 1. Restore the most recent cache matching the prefix
+      - name: Restore State Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache
+          key: c1-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            c1-state-
+
+      # 2. Run the checker
+      - name: Execute Course Checker
+        id: checker
+        run: python check_c1_courses.py
+
+      # 3. Save cache when new courses are found (or refresh TTL)
+      - name: Save State Cache
+        uses: actions/cache/save@v4
+        if: steps.checker.outputs.new_courses_notified == 'true'
+        with:
+          path: .cache
+          key: c1-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Prune Old Caches (Keep Latest 10)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Fetch all fx-state caches, sort by ID descending, skip the first 10, delete the rest
+          gh api "/repos/$REPO/actions/caches?per_page=100" \
+            --jq '.actions_caches[] | select(.key | startswith("fx-state-")) | .id' \
+          | tail -n +11 \
+          | while read -r cache_id; do
+            echo "Deleting surplus cache ID: $cache_id"
+            gh api --method DELETE "/repos/$REPO/actions/caches/$cache_id"
+          done
+          
+      - name: Prune Workflow Runs Older Than 12 Hours
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          CUTOFF=$(date -u -d '12 hours ago' +%s)
+          gh api --paginate "/repos/$REPO/actions/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(((.created_at[0:19] + "Z") | fromdateiso8601) < '$CUTOFF') | .id' \
+          | while read -r run_id; do
+            echo "Deleting run ID: $run_id"
+            gh api --method DELETE "/repos/$REPO/actions/runs/$run_id"
+          done
