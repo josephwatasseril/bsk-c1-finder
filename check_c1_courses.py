@@ -33,7 +33,7 @@ MAX_START_DATE = (
     else None
 )
 
-max_end_raw = os.getenv("MAX_END_DATE", "2027-03-01")
+max_end_raw = os.getenv("MAX_END_DATE", "2027-03-15")
 MAX_END_DATE = datetime.strptime(max_end_raw, "%Y-%m-%d").date()
 
 EXCLUDE_SPECIALIZED = os.getenv("EXCLUDE_SPECIALIZED", "true").lower() == "true"
@@ -93,11 +93,10 @@ HEADERS = {
 # NETWORKING & RESILIENCE
 # ---------------------------------------------------------------------------
 def get_resilient_session() -> requests.Session:
-    """Builds a requests Session with backoff retries for transient 5xx/429 errors."""
     session = requests.Session()
     retries = Retry(
         total=4,
-        backoff_factor=1.5,  # waits 1.5s, 3s, 6s...
+        backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
         raise_on_status=False,
     )
@@ -107,7 +106,6 @@ def get_resilient_session() -> requests.Session:
     return session
 
 def send_admin_alert(status_code: int, response_text: str):
-    """Sends a critical alert to NTFY_ADMIN_TOPIC if API key or authorization fails."""
     target_topic = NTFY_ADMIN_TOPIC or NTFY_TOPIC
     if not target_topic:
         print("[ADMIN ALERT] Skipped: No admin topic configured.")
@@ -143,19 +141,22 @@ def build_angebot_url(termin_id):
     return f"https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse/angebot/{termin_id}"
 
 def clean_html_text(raw_html: str) -> str:
-    """Sanitizes HTML snippets, replacing <br> and <p> with clean inline separators."""
+    """Sanitizes HTML snippets, replacing block tags with spaces and lines with ' • '."""
     if not raw_html:
         return "N/A"
     
     text = html.unescape(raw_html)
-    # Convert line breaks to newlines
-    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
-    # Strip all remaining HTML tags
+    # Convert block tags and breaks into newlines so words don't collide
+    text = re.sub(r"(?i)<\s*(?:br\s*/?|/\s*p|/\s*div|/\s*li)\s*>", "\n", text)
+    text = re.sub(r"(?i)<\s*(?:p|div|li)\s*>", "\n", text)
     text = re.sub(r"<[^>]+>", "", text)
     
-    # Strip each line and join with readable separator
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return " | ".join(lines) if lines else "N/A"
+    return " • ".join(lines) if lines else "N/A"
+
+def escape_markdown_cell(value: str) -> str:
+    """Escapes pipe characters and strips newlines so cells don't break markdown tables."""
+    return str(value).replace("|", "\\|").replace("\n", " ").strip()
 
 def is_specialized_course(termin):
     angebot = termin.get("angebot", {})
@@ -171,11 +172,6 @@ def is_specialized_course(termin):
     return False
 
 def evaluate_termin(termin, allow_in_person: bool):
-    """
-    Evaluates an offering against filters.
-    Returns (status, reason):
-      status in ['MATCH', 'SPECIALIZED', 'BAD_START', 'BAD_END', 'BAD_FORMAT']
-    """
     if EXCLUDE_SPECIALIZED and is_specialized_course(termin):
         return "SPECIALIZED", "Fachspezifischer Kurs (Frühpädagogik/Medizin/etc.)"
 
@@ -246,7 +242,7 @@ def send_ntfy_notification(termin, termin_id, category):
     except Exception as e:
         print(f"[ERROR] Failed to send NTFY notification: {e}")
 
-def write_github_summary(stats, newly_matched_items):
+def write_github_summary(stats, all_matched_items):
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
@@ -255,6 +251,8 @@ def write_github_summary(stats, newly_matched_items):
     if MAX_START_DATE:
         date_range_str += f" and on/before `{MAX_START_DATE.strftime('%d.%m.%Y')}`"
     date_range_str += f" | Ends before `{MAX_END_DATE.strftime('%d.%m.%Y')}`"
+
+    total_new = stats["new_berlin"] + stats["new_virtual"]
 
     markdown = [
         "## C1 Berufssprachkurs Checker Summary\n",
@@ -266,23 +264,43 @@ def write_github_summary(stats, newly_matched_items):
         f"| Excluded: Start Date Mismatch | {stats['bad_start']} |",
         f"| Excluded: End Date Mismatch (>= Max End) | {stats['bad_end']} |",
         f"| Excluded: Non-Virtual Outside Berlin | {stats['bad_format']} |",
-        f"| Already Notified (Cached) | {stats['already_notified']} |",
-        f"| **New Matches: Berlin & Umgebung (50km)** | **{stats['new_berlin']}** |",
-        f"| **New Matches: Virtuell (Bundesweit)** | **{stats['new_virtual']}** |",
-        f"| **Total New Courses Notified** | **{stats['new_berlin'] + stats['new_virtual']}** |\n",
+        f"| **Active Qualifying Courses** | **{len(all_matched_items)}** |",
+        f"| ↳ Berlin & Umgebung (50km) | {stats['count_berlin']} |",
+        f"| ↳ Virtuell (Bundesweit) | {stats['count_virtual']} |",
+        f"| **New Push Alerts Sent This Run** | **{total_new}** |\n",
     ]
 
-    if newly_matched_items:
-        markdown.append("### Newly Found & Notified Courses\n")
-        markdown.append("| ID | Category | Provider | Location | Schedule | Duration | Title | Link |")
-        markdown.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
-        for item in newly_matched_items:
+    if all_matched_items:
+        markdown.append("### Active Qualifying Courses\n")
+        markdown.append("| ID | Notified? | Category | Provider | Location | Schedule | Duration | Title | Link |")
+        markdown.append("| :--- | :---: | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+
+        # Display newly alerted courses first, then cached, both sorted by start date
+        all_matched_items.sort(
+            key=lambda x: (
+                0 if x["is_new"] else 1,
+                x["start_date_obj"] or datetime.max.date()
+            )
+        )
+
+        for item in all_matched_items:
+            badge = "🔔 **New**" if item["is_new"] else "✓ Cached"
+            
+            c_id = escape_markdown_cell(item["id"])
+            c_cat = escape_markdown_cell(item["category"])
+            c_prov = escape_markdown_cell(item["provider"])
+            c_city = escape_markdown_cell(item["city"])
+            c_sched = escape_markdown_cell(item["schedule"])
+            c_dur = escape_markdown_cell(f"{item['start']} - {item['end']}")
+            c_title = escape_markdown_cell(item["title"])
+            c_link = f"[Open Angebot]({item['link']})"
+
             markdown.append(
-                f"| `{item['id']}` | **{item['category']}** | {item['provider']} | {item['city']} | "
-                f"{item['schedule']} | {item['start']} - {item['end']} | {item['title']} | [Open Angebot]({item['link']}) |"
+                f"| `{c_id}` | {badge} | **{c_cat}** | {c_prov} | {c_city} | "
+                f"{c_sched} | {c_dur} | {c_title} | {c_link} |"
             )
     else:
-        markdown.append("> *No new matching course offerings found in this run.*\n")
+        markdown.append("> *No matching course offerings currently available.*\n")
 
     with open(summary_path, "a", encoding="utf-8") as f:
         f.write("\n".join(markdown) + "\n")
@@ -310,10 +328,13 @@ def main():
         "already_notified": 0,
         "new_berlin": 0,
         "new_virtual": 0,
+        "count_berlin": 0,
+        "count_virtual": 0,
     }
 
     evaluated_in_run = set()
-    newly_matched_items = []
+    all_matched_items = []
+    has_new_notifications = False
     session = get_resilient_session()
 
     for target in SEARCH_TARGETS:
@@ -324,7 +345,6 @@ def main():
             url = target["url_template"].format(page=page)
             resp = session.get(url, headers=HEADERS, timeout=25)
 
-            # Check for API key invalidation
             if resp.status_code in (401, 403):
                 print(f"Auth failure HTTP {resp.status_code} for {target['name']}.")
                 send_admin_alert(resp.status_code, resp.text)
@@ -359,30 +379,42 @@ def main():
                 elif status == "BAD_FORMAT":
                     stats["bad_format"] += 1
                 elif status == "MATCH":
-                    if termin_id in notified_ids:
-                        stats["already_notified"] += 1
-                    else:
-                        category = target["category"]
-                        if category == "Berlin (50km)":
+                    category = target["category"]
+                    is_new = termin_id not in notified_ids
+
+                    if category == "Berlin (50km)":
+                        stats["count_berlin"] += 1
+                        if is_new:
                             stats["new_berlin"] += 1
-                        else:
+                    else:
+                        stats["count_virtual"] += 1
+                        if is_new:
                             stats["new_virtual"] += 1
 
+                    if is_new:
                         send_ntfy_notification(t, termin_id, category)
                         notified_ids.add(termin_id)
+                        has_new_notifications = True
+                    else:
+                        stats["already_notified"] += 1
 
-                        angebot = t.get("angebot", {})
-                        newly_matched_items.append({
-                            "id": termin_id,
-                            "category": category,
-                            "provider": angebot.get("bildungsanbieter", {}).get("name", "N/A"),
-                            "city": t.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A"),
-                            "schedule": clean_html_text(t.get("unterrichtszeiten")),
-                            "start": ms_to_berlin_datetime(t.get("beginn")).strftime("%d.%m.%Y"),
-                            "end": ms_to_berlin_datetime(t.get("ende")).strftime("%d.%m.%Y"),
-                            "title": angebot.get("titel", "N/A"),
-                            "link": build_angebot_url(termin_id),
-                        })
+                    start_dt = ms_to_berlin_datetime(t.get("beginn"))
+                    end_dt = ms_to_berlin_datetime(t.get("ende"))
+                    angebot = t.get("angebot", {})
+
+                    all_matched_items.append({
+                        "id": termin_id,
+                        "is_new": is_new,
+                        "category": category,
+                        "provider": angebot.get("bildungsanbieter", {}).get("name", "N/A"),
+                        "city": t.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A"),
+                        "schedule": clean_html_text(t.get("unterrichtszeiten")),
+                        "start": start_dt.strftime("%d.%m.%Y") if start_dt else "N/A",
+                        "end": end_dt.strftime("%d.%m.%Y") if end_dt else "N/A",
+                        "start_date_obj": start_dt.date() if start_dt else None,
+                        "title": angebot.get("titel", "N/A"),
+                        "link": build_angebot_url(termin_id),
+                    })
 
             page_info = data.get("page", {})
             total_pages = page_info.get("totalPages", 1)
@@ -391,16 +423,16 @@ def main():
             page += 1
 
     total_new = stats["new_berlin"] + stats["new_virtual"]
-    print(f"Scan complete. Evaluated: {stats['total']}, New alerts dispatched: {total_new}.")
+    print(f"Scan complete. Evaluated: {stats['total']}, Active Matches: {len(all_matched_items)}, New Alerts: {total_new}.")
 
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(list(notified_ids)), f, indent=2)
 
-    write_github_summary(stats, newly_matched_items)
+    write_github_summary(stats, all_matched_items)
 
     if "GITHUB_OUTPUT" in os.environ:
         with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
-            gh_out.write(f"new_courses_notified={str(bool(newly_matched_items)).lower()}\n")
+            gh_out.write(f"new_courses_notified={str(has_new_notifications).lower()}\n")
 
 if __name__ == "__main__":
     main()
