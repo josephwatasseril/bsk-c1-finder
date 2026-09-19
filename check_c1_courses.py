@@ -256,48 +256,70 @@ def send_ntfy_notification(termin, termin_id, category):
 
     angebot = termin.get("angebot", {})
     provider = angebot.get("bildungsanbieter", {}).get("name", "Unbekannter Anbieter")
-    title = angebot.get("titel", "Berufssprachkurs C1")
-
+    city = termin.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A")
+    
     start_str = ms_to_berlin_datetime(termin.get("beginn")).strftime("%d.%m.%Y")
     end_str = ms_to_berlin_datetime(termin.get("ende")).strftime("%d.%m.%Y")
     
     deadline_dt = ms_to_berlin_datetime(termin.get("anmeldeschluss"))
-    deadline_str = deadline_dt.strftime("%d.%m.%Y") if deadline_dt else "Keine Angabe"
+    deadline_str = deadline_dt.strftime("%d.%m.%Y") if deadline_dt else None
 
-    city = termin.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A")
-    is_vollzeit, pace_label, dauer_label = get_pace_classification(termin)
+    is_vollzeit, pace_label, _ = get_pace_classification(termin)
     seats_str, _ = get_seats_status(termin)
-
     zeiten_str = clean_html_text(termin.get("unterrichtszeiten"))
     notes_str = clean_html_text(termin.get("bemerkungZeit"))
     contact_email = extract_best_contact_email(termin)
     course_url = build_angebot_url(termin_id)
 
-    message_lines = [
-        f"Kategorie: {category}",
-        f"Schule: {provider}",
-        f"Ort: {city}",
-        f"Unterrichtsform: {pace_label} ({dauer_label})",
+    # 1. Concise Title: Mode, City, and Start Date
+    icon = "📍" if "Berlin" in category else "🌐"
+    title_pace = f"⚡ {pace_label}" if is_vollzeit else pace_label
+    title = f"{icon} C1 BSK ({city}): ab {start_str} • {title_pace}"
+
+    # 2. Compact Body: Pack key decision factors into 2-3 lines
+    body_lines = [
+        f"**{provider}** ({city})",
+        f"🗓️ {start_str} – {end_str} • ⏰ {zeiten_str}",
     ]
+
+    # Status badges line (Frist + Plätze)
+    meta_badges = []
+    if deadline_str:
+        meta_badges.append(f"⏳ Frist: {deadline_str}")
     if seats_str:
-        message_lines.append(f"Teilnehmer: {seats_str}")
-    message_lines.append(f"Zeiten: {zeiten_str}")
+        meta_badges.append(f"👥 {seats_str}")
+    if meta_badges:
+        body_lines.append(" • ".join(meta_badges))
+
+    # Notes line (only if relevant)
     if notes_str and notes_str != "N/A":
-        message_lines.append(f"Hinweise: {notes_str}")
-    message_lines.extend([
-        f"Laufzeit: {start_str} - {end_str}",
-        f"Anmeldeschluss: {deadline_str}",
-        f"Kontakt: {contact_email}",
-        f"\nTitel: {title}",
-    ])
+        body_lines.append(f"📌 _{notes_str[:120]}_")
+
+    # 3. Interactive Quick Actions
+    actions = [
+        {
+            "action": "view",
+            "label": "🌐 Kurs öffnen",
+            "url": course_url,
+        }
+    ]
+    if contact_email and contact_email != "N/A":
+        subject = f"Anfrage C1 Berufssprachkurs (ID {termin_id})"
+        actions.append({
+            "action": "view",
+            "label": "✉️ E-Mail",
+            "url": f"mailto:{contact_email}?subject={requests.utils.quote(subject)}",
+        })
 
     payload = {
         "topic": NTFY_TOPIC,
-        "title": f"C1 BSK [{category} | {pace_label}]: {city} ({start_str})",
-        "message": "\n".join(message_lines),
+        "title": title,
+        "message": "\n".join(body_lines),
         "priority": 4,
-        "tags": ["mortar_board", "calendar"],
+        "tags": ["mortar_board"],
+        "markdown": True,
         "click": course_url,
+        "actions": actions,
     }
 
     try:
