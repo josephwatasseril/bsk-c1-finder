@@ -33,6 +33,7 @@ MAX_END_DATE = datetime.strptime(max_end_raw, "%Y-%m-%d").date()
 
 EXCLUDE_SPECIALIZED = os.getenv("EXCLUDE_SPECIALIZED", "true").lower() == "true"
 SPECIALIZED_KEYWORDS = [
+    "frühpädagogische",
     "frühpädagogik",
     "heilberufe",
     "humanmedizin",
