@@ -33,7 +33,7 @@ MAX_START_DATE = (
     else None
 )
 
-max_end_raw = os.getenv("MAX_END_DATE", "2027-03-01")
+max_end_raw = os.getenv("MAX_END_DATE", "2027-03-16")
 MAX_END_DATE = datetime.strptime(max_end_raw, "%Y-%m-%d").date()
 
 EXCLUDE_SPECIALIZED = os.getenv("EXCLUDE_SPECIALIZED", "true").lower() == "true"
@@ -175,22 +175,16 @@ def extract_best_contact_email(termin) -> str:
     return "N/A"
 
 def get_pace_classification(termin):
-    """Detects whether a course is Vollzeit and retrieves its Dauer string."""
-    form_name = (termin.get("unterrichtsform", {}).get("bezeichnung") or "").lower()
-    title = (termin.get("angebot", {}).get("titel") or "").lower()
-    zeiten = (termin.get("unterrichtszeiten") or "").lower()
+    """
+    Reads directly from unterrichtsform.bezeichnung (e.g. 'Vor-Ort-Teilzeit', 'Vor-Ort-Vollzeit').
+    Highlights Vollzeit if present in the bezeichnung or course title.
+    """
+    uform_name = termin.get("unterrichtsform", {}).get("bezeichnung") or "Keine Angabe"
     dauer_name = termin.get("dauer", {}).get("bezeichnung", "N/A")
+    title = (termin.get("angebot", {}).get("titel") or "").lower()
 
-    is_vollzeit = (
-        "vollzeit" in form_name
-        or "vollzeit" in title
-        or "vollzeit" in zeiten
-        or "25 unterrichtseinheiten" in zeiten
-        or "25 ue" in zeiten
-        or "20 unterrichtseinheiten" in zeiten
-        or "20 ue" in zeiten
-    )
-    return is_vollzeit, dauer_name
+    is_vollzeit = "vollzeit" in uform_name.lower() or "vollzeit" in title
+    return is_vollzeit, uform_name, dauer_name
 
 def is_specialized_course(termin):
     angebot = termin.get("angebot", {})
@@ -222,10 +216,12 @@ def evaluate_termin(termin, allow_in_person: bool):
 
     if not allow_in_person:
         form_id = termin.get("unterrichtsform", {}).get("id")
+        form_label = (termin.get("unterrichtsform", {}).get("bezeichnung") or "").lower()
         titel = termin.get("angebot", {}).get("titel", "").lower()
         zeiten = (termin.get("unterrichtszeiten") or "").lower()
 
-        is_virtual_form = (form_id == 5)
+        # Form ID 5 or 'e-learning' / 'virtuell' in bezeichnung
+        is_virtual_form = (form_id == 5) or ("virtuell" in form_label) or ("e-learning" in form_label)
         is_hybrid_in_person = ("teilweise virtuell" in titel) or ("in präsenz" in zeiten)
         if not (is_virtual_form and not is_hybrid_in_person):
             return "BAD_FORMAT", "Präsenz- oder Hybridkurs außerhalb Berlins"
@@ -248,9 +244,7 @@ def send_ntfy_notification(termin, termin_id, category):
     deadline_str = deadline_dt.strftime("%d.%m.%Y") if deadline_dt else "Keine Angabe"
 
     city = termin.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A")
-    form_label = termin.get("unterrichtsform", {}).get("bezeichnung", "N/A")
-    is_vollzeit, dauer_label = get_pace_classification(termin)
-    pace_str = "Vollzeit" if is_vollzeit else "Teilzeit/Flex"
+    is_vollzeit, pace_label, dauer_label = get_pace_classification(termin)
 
     zeiten_str = clean_html_text(termin.get("unterrichtszeiten"))
     notes_str = clean_html_text(termin.get("bemerkungZeit"))
@@ -260,8 +254,8 @@ def send_ntfy_notification(termin, termin_id, category):
     message_lines = [
         f"Kategorie: {category}",
         f"Schule: {provider}",
-        f"Ort: {city} ({form_label})",
-        f"Intensität: {pace_str} ({dauer_label})",
+        f"Ort: {city}",
+        f"Unterrichtsform: {pace_label} ({dauer_label})",
         f"Zeiten: {zeiten_str}",
     ]
     if notes_str and notes_str != "N/A":
@@ -275,7 +269,7 @@ def send_ntfy_notification(termin, termin_id, category):
 
     payload = {
         "topic": NTFY_TOPIC,
-        "title": f"C1 BSK [{category}]: {city} ({start_str})",
+        "title": f"C1 BSK [{category} | {pace_label}]: {city} ({start_str})",
         "message": "\n".join(message_lines),
         "priority": 4,
         "tags": ["mortar_board", "calendar"],
@@ -322,6 +316,7 @@ def write_github_summary(stats, all_matched_items):
         markdown.append("| Status & Mode | Course & School | Pace & Duration | Dates & Deadline | Schedule & Notes |")
         markdown.append("| :---: | :--- | :--- | :--- | :--- |")
 
+        # Newly alerted courses first, then cached, both chronologically by start date
         all_matched_items.sort(
             key=lambda x: (
                 0 if x["is_new"] else 1,
@@ -330,11 +325,11 @@ def write_github_summary(stats, all_matched_items):
         )
 
         for item in all_matched_items:
-            # 1. Status & Mode
+            # 1. Status & Mode (using <sub> for the update timestamp)
             badge = "🔔 **New**" if item["is_new"] else "✓ Cached"
             icon = "📍" if "Berlin" in item["category"] else "🌐"
             stand_str = (
-                f"<small>🕒 Stand: {item['updated']}</small>"
+                f"<sub>🕒 Stand: {item['updated']}</sub>"
                 if item["updated"] != "—"
                 else ""
             )
@@ -342,31 +337,32 @@ def write_github_summary(stats, all_matched_items):
             if stand_str:
                 status_col += f"<br>{stand_str}"
 
-            # 2. Course & School (School + Location paired together)
+            # 2. Course & School (Provider & Location in <sub>)
             title_esc = escape_markdown_cell(item["title"])
             prov_esc = escape_markdown_cell(item["provider"])
             city_esc = escape_markdown_cell(item["city"])
-            course_col = f"[**{title_esc}**]({item['link']})<br><small>🏫 {prov_esc} • 📍 {city_esc}</small>"
+            course_col = f"[**{title_esc}**]({item['link']})<br><sub>🏫 {prov_esc} • 📍 {city_esc}</sub>"
 
-            # 3. Pace & Duration (Vollzeit highlighted)
-            pace_badge = "⚡ **Vollzeit**" if item["is_vollzeit"] else "Teilzeit / Flex"
+            # 3. Pace & Duration (Duration in <sub>)
+            pace_label_esc = escape_markdown_cell(item["pace_label"])
+            pace_badge = f"⚡ **{pace_label_esc}**" if item["is_vollzeit"] else pace_label_esc
             dauer_esc = escape_markdown_cell(item["dauer"])
-            pace_col = f"{pace_badge}<br><small>{dauer_esc}</small>"
+            pace_col = f"{pace_badge}<br><sub>{dauer_esc}</sub>"
 
-            # 4. Dates & Deadline
+            # 4. Dates & Deadline (Deadline in <sub>)
             dur_str = f"🗓️ {item['start']} – {item['end']}"
             dead_str = (
-                f"<small>⏳ Anm.: {item['deadline']}</small>"
+                f"<sub>⏳ Anm.: {item['deadline']}</sub>"
                 if item["deadline"] != "—"
-                else "<small>⏳ Anm.: Keine Angabe</small>"
+                else "<sub>⏳ Anm.: Keine Angabe</sub>"
             )
             dates_col = f"{dur_str}<br>{dead_str}"
 
-            # 5. Schedule & Notes
+            # 5. Schedule & Notes (Notes in <sub><em>...</em></sub>)
             sched_esc = escape_markdown_cell(item["schedule"])
             notes_esc = escape_markdown_cell(item["notes"]) if item["notes"] != "N/A" else ""
             if notes_esc:
-                sched_col = f"{sched_esc}<br><small>📌 <em>{notes_esc}</em></small>"
+                sched_col = f"{sched_esc}<br><sub>📌 <em>{notes_esc}</em></sub>"
             else:
                 sched_col = sched_esc
 
@@ -477,7 +473,7 @@ def main():
                     deadline_dt = ms_to_berlin_datetime(t.get("anmeldeschluss"))
                     updated_dt = ms_to_berlin_datetime(t.get("aktualisierungsdatum"))
 
-                    is_vollzeit, dauer_name = get_pace_classification(t)
+                    is_vollzeit, pace_label, dauer_name = get_pace_classification(t)
                     angebot = t.get("angebot", {})
 
                     all_matched_items.append({
@@ -487,6 +483,7 @@ def main():
                         "provider": angebot.get("bildungsanbieter", {}).get("name", "N/A"),
                         "city": t.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A"),
                         "is_vollzeit": is_vollzeit,
+                        "pace_label": pace_label,
                         "dauer": dauer_name,
                         "schedule": clean_html_text(t.get("unterrichtszeiten")),
                         "notes": clean_html_text(t.get("bemerkungZeit")),
