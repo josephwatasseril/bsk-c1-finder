@@ -92,14 +92,8 @@ def ms_to_berlin_datetime(ms):
         return None
     return datetime.fromtimestamp(ms / 1000.0, tz=BERLIN_TZ)
 
-def get_angebot_id(termin):
-    """Extracts the catalog Angebot ID from the nested offering structure."""
-    angebot = termin.get("angebot", {})
-    return str(angebot.get("id") or termin.get("id"))
-
-def build_angebot_url(termin):
-    angebot_id = get_angebot_id(termin)
-    return f"https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse/angebot/{angebot_id}"
+def build_angebot_url(termin_id):
+    return f"https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse/angebot/{termin_id}"
 
 def is_specialized_course(termin):
     angebot = termin.get("angebot", {})
@@ -146,13 +140,12 @@ def evaluate_termin(termin, allow_in_person: bool):
 
     return "MATCH", "Kriterien erfüllt"
 
-def send_ntfy_notification(termin, category):
+def send_ntfy_notification(termin, termin_id, category):
     if not NTFY_TOPIC:
         print("[NTFY] Skipped: NTFY_TOPIC environment variable is not configured.")
         return
 
     angebot = termin.get("angebot", {})
-    angebot_id = get_angebot_id(termin)
     provider = angebot.get("bildungsanbieter", {}).get("name", "Unbekannter Anbieter")
     title = angebot.get("titel", "Berufssprachkurs C1")
 
@@ -161,11 +154,11 @@ def send_ntfy_notification(termin, category):
     city = termin.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A")
     form_label = termin.get("unterrichtsform", {}).get("bezeichnung", "N/A")
     contact_email = angebot.get("bildungsanbieter", {}).get("email") or "N/A"
-    course_url = build_angebot_url(termin)
+    course_url = build_angebot_url(termin_id)
 
     message = (
         f"Kategorie: {category}\n"
-        f"Angebot ID: {angebot_id}\n"
+        f"ID: {termin_id}\n"
         f"Schule: {provider}\n"
         f"Ort: {city} ({form_label})\n"
         f"Laufzeit: {start_str} - {end_str}\n"
@@ -185,7 +178,7 @@ def send_ntfy_notification(termin, category):
     try:
         resp = requests.post("https://ntfy.sh", json=payload, timeout=10)
         resp.raise_for_status()
-        print(f"[NTFY] Notification sent for Angebot ID {angebot_id} ({category})")
+        print(f"[NTFY] Notification sent for ID {termin_id} ({category})")
     except Exception as e:
         print(f"[ERROR] Failed to send NTFY notification: {e}")
 
@@ -217,11 +210,11 @@ def write_github_summary(stats, newly_matched_items):
 
     if newly_matched_items:
         markdown.append("### Newly Found & Notified Courses\n")
-        markdown.append("| Angebot ID | Category | Provider | Location | Format | Duration | Title | Link |")
+        markdown.append("| ID | Category | Provider | Location | Format | Duration | Title | Link |")
         markdown.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
         for item in newly_matched_items:
             markdown.append(
-                f"| `{item['angebot_id']}` | **{item['category']}** | {item['provider']} | {item['city']} | "
+                f"| `{item['id']}` | **{item['category']}** | {item['provider']} | {item['city']} | "
                 f"{item['form']} | {item['start']} - {item['end']} | {item['title']} | [Open Angebot]({item['link']}) |"
             )
     else:
@@ -278,9 +271,7 @@ def main():
 
             for t in termine:
                 termin_id = str(t.get("id"))
-                angebot_id = get_angebot_id(t)
 
-                # Avoid re-evaluating duplicate intakes returned across both queries in a single run
                 if termin_id in evaluated_in_run:
                     continue
                 evaluated_in_run.add(termin_id)
@@ -297,8 +288,7 @@ def main():
                 elif status == "BAD_FORMAT":
                     stats["bad_format"] += 1
                 elif status == "MATCH":
-                    # Check against the cache using the catalog Angebot ID
-                    if angebot_id in notified_ids:
+                    if termin_id in notified_ids:
                         stats["already_notified"] += 1
                     else:
                         category = target["category"]
@@ -307,12 +297,12 @@ def main():
                         else:
                             stats["new_virtual"] += 1
 
-                        send_ntfy_notification(t, category)
-                        notified_ids.add(angebot_id)
+                        send_ntfy_notification(t, termin_id, category)
+                        notified_ids.add(termin_id)
 
                         angebot = t.get("angebot", {})
                         newly_matched_items.append({
-                            "angebot_id": angebot_id,
+                            "id": termin_id,
                             "category": category,
                             "provider": angebot.get("bildungsanbieter", {}).get("name", "N/A"),
                             "city": t.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A"),
@@ -320,7 +310,7 @@ def main():
                             "start": ms_to_berlin_datetime(t.get("beginn")).strftime("%d.%m.%Y"),
                             "end": ms_to_berlin_datetime(t.get("ende")).strftime("%d.%m.%Y"),
                             "title": angebot.get("titel", "N/A"),
-                            "link": build_angebot_url(t),
+                            "link": build_angebot_url(termin_id),
                         })
 
             page_info = data.get("page", {})
