@@ -96,7 +96,7 @@ def get_resilient_session() -> requests.Session:
     session = requests.Session()
     retries = Retry(
         total=4,
-        backoff_factor=1.5,
+        backoff_factor=2,
         status_forcelist=[429, 500, 502, 503, 504],
         raise_on_status=False,
     )
@@ -146,7 +146,6 @@ def clean_html_text(raw_html: str) -> str:
         return "N/A"
     
     text = html.unescape(raw_html)
-    # Convert block tags and breaks into newlines so words don't collide
     text = re.sub(r"(?i)<\s*(?:br\s*/?|/\s*p|/\s*div|/\s*li)\s*>", "\n", text)
     text = re.sub(r"(?i)<\s*(?:p|div|li)\s*>", "\n", text)
     text = re.sub(r"<[^>]+>", "", text)
@@ -157,6 +156,19 @@ def clean_html_text(raw_html: str) -> str:
 def escape_markdown_cell(value: str) -> str:
     """Escapes pipe characters and strips newlines so cells don't break markdown tables."""
     return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+def extract_best_contact_email(termin) -> str:
+    """Extracts direct coordinator contact email, falling back to provider headquarters email."""
+    for person in termin.get("ansprechpartner", []):
+        email = person.get("email")
+        if email and "@" in email:
+            return email.strip()
+            
+    provider_email = termin.get("angebot", {}).get("bildungsanbieter", {}).get("email")
+    if provider_email and "@" in provider_email:
+        return provider_email.strip()
+        
+    return "N/A"
 
 def is_specialized_course(termin):
     angebot = termin.get("angebot", {})
@@ -209,10 +221,14 @@ def send_ntfy_notification(termin, termin_id, category):
 
     start_str = ms_to_berlin_datetime(termin.get("beginn")).strftime("%d.%m.%Y")
     end_str = ms_to_berlin_datetime(termin.get("ende")).strftime("%d.%m.%Y")
+    
+    deadline_dt = ms_to_berlin_datetime(termin.get("anmeldeschluss"))
+    deadline_str = deadline_dt.strftime("%d.%m.%Y") if deadline_dt else "Keine Angabe"
+
     city = termin.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A")
     form_label = termin.get("unterrichtsform", {}).get("bezeichnung", "N/A")
     zeiten_str = clean_html_text(termin.get("unterrichtszeiten"))
-    contact_email = angebot.get("bildungsanbieter", {}).get("email") or "N/A"
+    contact_email = extract_best_contact_email(termin)
     course_url = build_angebot_url(termin_id)
 
     message = (
@@ -222,6 +238,7 @@ def send_ntfy_notification(termin, termin_id, category):
         f"Ort: {city} ({form_label})\n"
         f"Zeiten: {zeiten_str}\n"
         f"Laufzeit: {start_str} - {end_str}\n"
+        f"Anmeldeschluss: {deadline_str}\n"
         f"Kontakt: {contact_email}\n\n"
         f"Titel: {title}"
     )
@@ -272,10 +289,10 @@ def write_github_summary(stats, all_matched_items):
 
     if all_matched_items:
         markdown.append("### Active Qualifying Courses\n")
-        markdown.append("| ID | Notified? | Category | Provider | Location | Schedule | Duration | Title | Link |")
-        markdown.append("| :--- | :---: | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+        markdown.append("| ID | Notified? | Category | Provider | Location | Schedule | Duration | Deadline | Title | Link |")
+        markdown.append("| :--- | :---: | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
 
-        # Display newly alerted courses first, then cached, both sorted by start date
+        # Newly alerted courses first, then cached, both chronologically by start date
         all_matched_items.sort(
             key=lambda x: (
                 0 if x["is_new"] else 1,
@@ -292,12 +309,13 @@ def write_github_summary(stats, all_matched_items):
             c_city = escape_markdown_cell(item["city"])
             c_sched = escape_markdown_cell(item["schedule"])
             c_dur = escape_markdown_cell(f"{item['start']} - {item['end']}")
+            c_dead = escape_markdown_cell(item["deadline"])
             c_title = escape_markdown_cell(item["title"])
             c_link = f"[Open Angebot]({item['link']})"
 
             markdown.append(
                 f"| `{c_id}` | {badge} | **{c_cat}** | {c_prov} | {c_city} | "
-                f"{c_sched} | {c_dur} | {c_title} | {c_link} |"
+                f"{c_sched} | {c_dur} | {c_dead} | {c_title} | {c_link} |"
             )
     else:
         markdown.append("> *No matching course offerings currently available.*\n")
@@ -400,6 +418,7 @@ def main():
 
                     start_dt = ms_to_berlin_datetime(t.get("beginn"))
                     end_dt = ms_to_berlin_datetime(t.get("ende"))
+                    deadline_dt = ms_to_berlin_datetime(t.get("anmeldeschluss"))
                     angebot = t.get("angebot", {})
 
                     all_matched_items.append({
@@ -411,6 +430,7 @@ def main():
                         "schedule": clean_html_text(t.get("unterrichtszeiten")),
                         "start": start_dt.strftime("%d.%m.%Y") if start_dt else "N/A",
                         "end": end_dt.strftime("%d.%m.%Y") if end_dt else "N/A",
+                        "deadline": deadline_dt.strftime("%d.%m.%Y") if deadline_dt else "—",
                         "start_date_obj": start_dt.date() if start_dt else None,
                         "title": angebot.get("titel", "N/A"),
                         "link": build_angebot_url(termin_id),
