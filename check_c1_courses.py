@@ -14,6 +14,7 @@ STATE_FILE = CACHE_DIR / "state.json"
 # ENVIRONMENT VARIABLES & DEFAULTS
 # ---------------------------------------------------------------------------
 NTFY_TOPIC = os.getenv("NTFY_TOPIC")
+BA_API_KEY = os.getenv("BA_API_KEY")
 
 min_start_raw = os.getenv("MIN_START_DATE", "2026-10-01")
 MIN_START_DATE = datetime.strptime(min_start_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -51,9 +52,16 @@ PARAMS = {
     "size": 50,
 }
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "X-API-Key": "sprachfoerderung-suche",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.7",
+    "Origin": "https://web.arbeitsagentur.de",
+    "Referer": "https://web.arbeitsagentur.de/",
+    "X-API-Key": BA_API_KEY,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "DNT": "1",
 }
 
 # ---------------------------------------------------------------------------
