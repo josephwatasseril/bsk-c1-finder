@@ -19,6 +19,7 @@ jobs:
       MAX_END_DATE: ${{ inputs.max_end_date || vars.MAX_END_DATE }}
       EXCLUDE_SPECIALIZED: 'true'
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      BA_API_KEY: ${{ secrets.BA_API_KEY }}
 
     steps:
       - name: Checkout Code
