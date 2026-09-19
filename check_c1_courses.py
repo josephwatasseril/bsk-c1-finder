@@ -294,10 +294,10 @@ def write_github_summary(stats, all_matched_items):
 
     if all_matched_items:
         markdown.append("### Active Qualifying Courses\n")
-        markdown.append("| ID | Notified? | Category | Provider | Location | Schedule | Duration | Deadline | Title | Link |")
-        markdown.append("| :--- | :---: | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+        markdown.append("| Status & Mode | Course & School | Timing & Deadline | Schedule |")
+        markdown.append("| :---: | :--- | :--- | :--- |")
 
-        # Newly alerted courses first, then cached, both chronologically by start date
+        # Display newly alerted courses first, then cached, sorted by start date
         all_matched_items.sort(
             key=lambda x: (
                 0 if x["is_new"] else 1,
@@ -306,22 +306,34 @@ def write_github_summary(stats, all_matched_items):
         )
 
         for item in all_matched_items:
+            # 1. Status & Mode column
             badge = "🔔 **New**" if item["is_new"] else "✓ Cached"
-            
-            c_id = escape_markdown_cell(item["id"])
-            c_cat = escape_markdown_cell(item["category"])
-            c_prov = escape_markdown_cell(item["provider"])
-            c_city = escape_markdown_cell(item["city"])
-            c_sched = escape_markdown_cell(item["schedule"])
-            c_dur = escape_markdown_cell(f"{item['start']} - {item['end']}")
-            c_dead = escape_markdown_cell(item["deadline"])
-            c_title = escape_markdown_cell(item["title"])
-            c_link = f"[Open Angebot]({item['link']})"
+            icon = "📍" if "Berlin" in item["category"] else "🌐"
+            loc_label = escape_markdown_cell(item["city"])
+            mode_str = f"{icon} {item['category']}<br><small>({loc_label})</small>"
+            status_col = f"{badge}<br>{mode_str}"
 
-            markdown.append(
-                f"| `{c_id}` | {badge} | **{c_cat}** | {c_prov} | {c_city} | "
-                f"{c_sched} | {c_dur} | {c_dead} | {c_title} | {c_link} |"
+            # 2. Course & School column
+            title_esc = escape_markdown_cell(item["title"])
+            prov_esc = escape_markdown_cell(item["provider"])
+            course_col = (
+                f"[**{title_esc}**]({item['link']})<br>"
+                f"<small>🏫 {prov_esc} • ID: `{item['id']}`</small>"
             )
+
+            # 3. Timing & Deadline column
+            dur_str = f"🗓️ {item['start']} – {item['end']}"
+            dead_str = (
+                f"<small>⏳ Anm.: {item['deadline']}</small>"
+                if item["deadline"] != "—"
+                else "<small>⏳ Anm.: Keine Angabe</small>"
+            )
+            timing_col = f"{dur_str}<br>{dead_str}"
+
+            # 4. Schedule column
+            sched_col = escape_markdown_cell(item["schedule"])
+
+            markdown.append(f"| {status_col} | {course_col} | {timing_col} | {sched_col} |")
     else:
         markdown.append("> *No matching course offerings currently available.*\n")
 
