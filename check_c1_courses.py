@@ -1,9 +1,13 @@
 import os
+import re
+import html
 import json
 import requests
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 # ---------------------------------------------------------------------------
 # TIMEZONE & PATH CONFIGURATION
@@ -16,6 +20,7 @@ STATE_FILE = CACHE_DIR / "state.json"
 # ENVIRONMENT VARIABLES & DEFAULTS
 # ---------------------------------------------------------------------------
 NTFY_TOPIC = os.getenv("NTFY_TOPIC")
+NTFY_ADMIN_TOPIC = os.getenv("NTFY_ADMIN_TOPIC")
 BA_API_KEY = os.getenv("BA_API_KEY")
 
 min_start_raw = os.getenv("MIN_START_DATE", "2026-10-01")
@@ -85,16 +90,72 @@ HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
-# HELPER FUNCTIONS
+# NETWORKING & RESILIENCE
+# ---------------------------------------------------------------------------
+def get_resilient_session() -> requests.Session:
+    """Builds a requests Session with backoff retries for transient 5xx/429 errors."""
+    session = requests.Session()
+    retries = Retry(
+        total=4,
+        backoff_factor=1.5,  # waits 1.5s, 3s, 6s...
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+def send_admin_alert(status_code: int, response_text: str):
+    """Sends a critical alert to NTFY_ADMIN_TOPIC if API key or authorization fails."""
+    target_topic = NTFY_ADMIN_TOPIC or NTFY_TOPIC
+    if not target_topic:
+        print("[ADMIN ALERT] Skipped: No admin topic configured.")
+        return
+
+    payload = {
+        "topic": target_topic,
+        "title": f"Arbeitsagentur Watcher: HTTP {status_code} Error",
+        "message": (
+            f"The BA API returned HTTP {status_code}.\n"
+            f"The API key or request headers might have rotated.\n\n"
+            f"Response snippet:\n{response_text[:250]}"
+        ),
+        "priority": 5,
+        "tags": ["warning", "rotating_light"],
+    }
+    try:
+        resp = requests.post("https://ntfy.sh", json=payload, timeout=10)
+        resp.raise_for_status()
+        print(f"[ADMIN ALERT] Sent warning to topic '{target_topic}'.")
+    except Exception as e:
+        print(f"[ERROR] Failed to send admin alert: {e}")
+
+# ---------------------------------------------------------------------------
+# TEXT & DATE HELPERS
 # ---------------------------------------------------------------------------
 def ms_to_berlin_datetime(ms):
-    """Converts epoch milliseconds to Europe/Berlin localized datetime."""
     if not ms:
         return None
     return datetime.fromtimestamp(ms / 1000.0, tz=BERLIN_TZ)
 
 def build_angebot_url(termin_id):
     return f"https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse/angebot/{termin_id}"
+
+def clean_html_text(raw_html: str) -> str:
+    """Sanitizes HTML snippets, replacing <br> and <p> with clean inline separators."""
+    if not raw_html:
+        return "N/A"
+    
+    text = html.unescape(raw_html)
+    # Convert line breaks to newlines
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    # Strip all remaining HTML tags
+    text = re.sub(r"<[^>]+>", "", text)
+    
+    # Strip each line and join with readable separator
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return " | ".join(lines) if lines else "N/A"
 
 def is_specialized_course(termin):
     angebot = termin.get("angebot", {})
@@ -154,6 +215,7 @@ def send_ntfy_notification(termin, termin_id, category):
     end_str = ms_to_berlin_datetime(termin.get("ende")).strftime("%d.%m.%Y")
     city = termin.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A")
     form_label = termin.get("unterrichtsform", {}).get("bezeichnung", "N/A")
+    zeiten_str = clean_html_text(termin.get("unterrichtszeiten"))
     contact_email = angebot.get("bildungsanbieter", {}).get("email") or "N/A"
     course_url = build_angebot_url(termin_id)
 
@@ -162,6 +224,7 @@ def send_ntfy_notification(termin, termin_id, category):
         f"ID: {termin_id}\n"
         f"Schule: {provider}\n"
         f"Ort: {city} ({form_label})\n"
+        f"Zeiten: {zeiten_str}\n"
         f"Laufzeit: {start_str} - {end_str}\n"
         f"Kontakt: {contact_email}\n\n"
         f"Titel: {title}"
@@ -211,12 +274,12 @@ def write_github_summary(stats, newly_matched_items):
 
     if newly_matched_items:
         markdown.append("### Newly Found & Notified Courses\n")
-        markdown.append("| ID | Category | Provider | Location | Format | Duration | Title | Link |")
+        markdown.append("| ID | Category | Provider | Location | Schedule | Duration | Title | Link |")
         markdown.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
         for item in newly_matched_items:
             markdown.append(
                 f"| `{item['id']}` | **{item['category']}** | {item['provider']} | {item['city']} | "
-                f"{item['form']} | {item['start']} - {item['end']} | {item['title']} | [Open Angebot]({item['link']}) |"
+                f"{item['schedule']} | {item['start']} - {item['end']} | {item['title']} | [Open Angebot]({item['link']}) |"
             )
     else:
         markdown.append("> *No new matching course offerings found in this run.*\n")
@@ -251,6 +314,7 @@ def main():
 
     evaluated_in_run = set()
     newly_matched_items = []
+    session = get_resilient_session()
 
     for target in SEARCH_TARGETS:
         print(f"Scanning search query: {target['name']}...")
@@ -258,7 +322,13 @@ def main():
 
         while True:
             url = target["url_template"].format(page=page)
-            resp = requests.get(url, headers=HEADERS, timeout=25)
+            resp = session.get(url, headers=HEADERS, timeout=25)
+
+            # Check for API key invalidation
+            if resp.status_code in (401, 403):
+                print(f"Auth failure HTTP {resp.status_code} for {target['name']}.")
+                send_admin_alert(resp.status_code, resp.text)
+                return
 
             if resp.status_code != 200:
                 print(f"Fetch failed on page {page} for {target['name']}: HTTP {resp.status_code}")
@@ -307,7 +377,7 @@ def main():
                             "category": category,
                             "provider": angebot.get("bildungsanbieter", {}).get("name", "N/A"),
                             "city": t.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A"),
-                            "form": t.get("unterrichtsform", {}).get("bezeichnung", "N/A"),
+                            "schedule": clean_html_text(t.get("unterrichtszeiten")),
                             "start": ms_to_berlin_datetime(t.get("beginn")).strftime("%d.%m.%Y"),
                             "end": ms_to_berlin_datetime(t.get("ende")).strftime("%d.%m.%Y"),
                             "title": angebot.get("titel", "N/A"),
