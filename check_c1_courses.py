@@ -271,18 +271,18 @@ def send_ntfy_notification(termin, termin_id, category):
     contact_email = extract_best_contact_email(termin)
     course_url = build_angebot_url(termin_id)
 
-    # 1. Concise Title: Mode, City, and Start Date
+    # 1. Title: Mode, City, and Start Date
     icon = "📍" if "Berlin" in category else "🌐"
     title_pace = f"⚡ {pace_label}" if is_vollzeit else pace_label
     title = f"{icon} C1 BSK ({city}): ab {start_str} • {title_pace}"
 
-    # 2. Compact Body: Pack key decision factors into 2-3 lines
+    # 2. Clean Plain-Text Body (No Markdown syntax)
     body_lines = [
-        f"**{provider}** ({city})",
+        f"🏫 {provider} ({city})",
         f"🗓️ {start_str} – {end_str} • ⏰ {zeiten_str}",
     ]
 
-    # Status badges line (Frist + Plätze)
+    # Meta badges line (Frist + Plätze)
     meta_badges = []
     if deadline_str:
         meta_badges.append(f"⏳ Frist: {deadline_str}")
@@ -291,9 +291,9 @@ def send_ntfy_notification(termin, termin_id, category):
     if meta_badges:
         body_lines.append(" • ".join(meta_badges))
 
-    # Notes line (only if relevant)
+    # Notes line (clean text)
     if notes_str and notes_str != "N/A":
-        body_lines.append(f"📌 _{notes_str[:120]}_")
+        body_lines.append(f"📌 {notes_str}")
 
     # 3. Interactive Quick Actions
     actions = [
@@ -317,7 +317,6 @@ def send_ntfy_notification(termin, termin_id, category):
         "message": "\n".join(body_lines),
         "priority": 4,
         "tags": ["mortar_board"],
-        "markdown": True,
         "click": course_url,
         "actions": actions,
     }
