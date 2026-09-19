@@ -133,9 +133,14 @@ def send_admin_alert(status_code: int, response_text: str):
 # TEXT & DATE HELPERS
 # ---------------------------------------------------------------------------
 def ms_to_berlin_datetime(ms):
-    if not ms:
+    """Converts epoch milliseconds (int, float, or numeric string) to Europe/Berlin localized datetime."""
+    if ms is None or ms == "":
         return None
-    return datetime.fromtimestamp(ms / 1000.0, tz=BERLIN_TZ)
+    try:
+        val = float(ms)
+        return datetime.fromtimestamp(val / 1000.0, tz=BERLIN_TZ)
+    except (ValueError, TypeError, OSError):
+        return None
 
 def build_angebot_url(termin_id):
     return f"https://web.arbeitsagentur.de/sprachfoerderung/suche/berufssprachkurse/angebot/{termin_id}"
