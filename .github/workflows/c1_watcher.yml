@@ -1,4 +1,4 @@
-name: Monitor C1 BSK Courses
+name: Monitor BSK C1 Courses
 
 on:
   workflow_dispatch:
@@ -9,6 +9,10 @@ on:
       max_end_date:
         description: 'Override Latest End Date (YYYY-MM-DD)'
         required: false
+
+concurrency:
+  group: bsk-c1-watcher-cache
+  cancel-in-progress: false
 
 jobs:
   run-watcher:
