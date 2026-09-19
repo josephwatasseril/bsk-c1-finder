@@ -41,27 +41,23 @@ SPECIALIZED_KEYWORDS = [
 ]
 
 # ---------------------------------------------------------------------------
-# API CONSTANTS
+# EXACT CURL HEADERS
 # ---------------------------------------------------------------------------
-API_URL = "https://rest.arbeitsagentur.de/infosysbub/sprachfoerderung/pc/v1/bildungsangebot"
-PARAMS = {
-    "systematiken": "MC",
-    "sprachniveaus": "MC 01 4",  # C1 level
-    "umkreis": "Bundesweit",
-    "sort": "basc",
-    "size": 50,
-}
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.7",
-    "Origin": "https://web.arbeitsagentur.de",
-    "Referer": "https://web.arbeitsagentur.de/",
-    "X-API-Key": BA_API_KEY,
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-site",
-    "DNT": "1",
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.7",
+    "dnt": "1",
+    "origin": "https://web.arbeitsagentur.de",
+    "priority": "u=1, i",
+    "sec-ch-ua": '"Brave";v="153", "Not_A Brand";v="8", "Chromium";v="153"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+    "sec-gpc": "1",
+    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+    "x-api-key": BA_API_KEY,
 }
 
 # ---------------------------------------------------------------------------
@@ -79,7 +75,6 @@ def is_specialized_course(termin):
     if any(keyword in titel for keyword in SPECIALIZED_KEYWORDS):
         return True
 
-    # BAMF codes: MC 02 = Fachspezifisch, MC 03 = Anerkennung Heilberufe
     for syst in angebot.get("systematiken", []):
         if syst.get("codeNr") in ["MC 02", "MC 03"]:
             return True
@@ -108,7 +103,7 @@ def evaluate_termin(termin):
     if not end_dt or end_dt >= MAX_END_DATE:
         return "BAD_END", f"Ende {end_dt.strftime('%d.%m.%Y') if end_dt else 'N/A'} >= {MAX_END_DATE.strftime('%d.%m.%Y')}"
 
-    # 3. Location & Format Check
+    # 3. Location & Delivery Format Check
     adresse = termin.get("adresse", {})
     ort_info = adresse.get("ortStrasse", {})
     city = ort_info.get("name", "")
@@ -119,7 +114,7 @@ def evaluate_termin(termin):
     titel = termin.get("angebot", {}).get("titel", "").lower()
     zeiten = (termin.get("unterrichtszeiten") or "").lower()
 
-    # Form ID 5 corresponds to E-Learning / Virtuelles Klassenzimmer
+    # Form ID 5 is E-Learning / Virtuelles Klassenzimmer
     is_virtual_form = (form_id == 5)
     is_hybrid_in_person = ("teilweise virtuell" in titel) or ("in präsenz" in zeiten and not is_berlin)
     is_pure_virtual = is_virtual_form and not is_hybrid_in_person
@@ -131,7 +126,7 @@ def evaluate_termin(termin):
 
 def send_ntfy_notification(termin):
     if not NTFY_TOPIC:
-        print("[NTFY] Skipped: NTFY_TOPIC environment variable is not set.")
+        print("[NTFY] Skipped: NTFY_TOPIC environment variable is not configured.")
         return
 
     angebot = termin.get("angebot", {})
@@ -168,7 +163,7 @@ def send_ntfy_notification(termin):
     try:
         resp = requests.post("https://ntfy.sh", json=payload, timeout=10)
         resp.raise_for_status()
-        print(f"[NTFY] Notification successfully dispatched for termin ID {termin.get('id')}")
+        print(f"[NTFY] Notification sent for termin ID {termin.get('id')}")
     except Exception as e:
         print(f"[ERROR] Failed to send NTFY notification: {e}")
 
@@ -188,7 +183,7 @@ def write_github_summary(stats, newly_matched_items):
         "| Metric | Count |",
         "| :--- | :--- |",
         f"| Total Termine Evaluated | **{stats['total']}** |",
-        f"| Excluded: Specialized (Frühpädagogik/Medizin/etc.) | {stats['specialized']} |",
+        f"| Excluded: Specialized (Frühpädagogik/Medizin) | {stats['specialized']} |",
         f"| Excluded: Start Date Mismatch | {stats['bad_start']} |",
         f"| Excluded: End Date Mismatch (>= Max End) | {stats['bad_end']} |",
         f"| Excluded: Format/Location Mismatch | {stats['bad_location_format']} |",
@@ -206,13 +201,13 @@ def write_github_summary(stats, newly_matched_items):
                 f"{item['start']} - {item['end']} | {item['title']} | [Open Link]({item['link']}) |"
             )
     else:
-        markdown.append("> *No new matching course offerings detected in this run.*\n")
+        markdown.append("> *No new matching course offerings found in this run.*\n")
 
     with open(summary_path, "a", encoding="utf-8") as f:
         f.write("\n".join(markdown) + "\n")
 
 # ---------------------------------------------------------------------------
-# MAIN SCRIPT EXECUTION
+# MAIN EXECUTION
 # ---------------------------------------------------------------------------
 def main():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -238,13 +233,19 @@ def main():
     newly_matched_items = []
     page = 0
 
-    print("Fetching C1 Berufssprachkurs offerings from Arbeitsagentur API...")
+    print("Fetching C1 offerings with exact parameters...")
 
     while True:
-        params = {**PARAMS, "page": page}
-        resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=25)
+        # Construct the URL exactly matching the curl query string
+        url = (
+            f"https://rest.arbeitsagentur.de/infosysbub/sprachfoerderung/pc/v1/bildungsangebot"
+            f"?systematiken=MC&page={page}&umkreis=Bundesweit&sort=basc&sprachniveaus=MC%2001%204"
+        )
+
+        resp = requests.get(url, headers=HEADERS, timeout=25)
         if resp.status_code != 200:
             print(f"Fetch failed on page {page}: HTTP {resp.status_code}")
+            print(f"Server response body: {resp.text}")
             break
 
         data = resp.json()
@@ -296,14 +297,11 @@ def main():
 
     print(f"Scan complete. Evaluated: {stats['total']}, New notifications: {stats['new_matches']}.")
 
-    # Persist state back to .cache/state.json
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(list(notified_ids)), f, indent=2)
 
-    # Render summary table in GitHub Actions UI
     write_github_summary(stats, newly_matched_items)
 
-    # Export output flag for actions/cache step condition
     if "GITHUB_OUTPUT" in os.environ:
         with open(os.environ["GITHUB_OUTPUT"], "a") as gh_out:
             gh_out.write(f"new_courses_notified={str(bool(newly_matched_items)).lower()}\n")
