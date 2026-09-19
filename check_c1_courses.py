@@ -33,7 +33,7 @@ MAX_START_DATE = (
     else None
 )
 
-max_end_raw = os.getenv("MAX_END_DATE", "2027-03-16")
+max_end_raw = os.getenv("MAX_END_DATE", "2027-03-01")
 MAX_END_DATE = datetime.strptime(max_end_raw, "%Y-%m-%d").date()
 
 EXCLUDE_SPECIALIZED = os.getenv("EXCLUDE_SPECIALIZED", "true").lower() == "true"
@@ -130,7 +130,7 @@ def send_admin_alert(status_code: int, response_text: str):
         print(f"[ERROR] Failed to send admin alert: {e}")
 
 # ---------------------------------------------------------------------------
-# TEXT & DATE HELPERS
+# TEXT, DATE & FIELD PARSERS
 # ---------------------------------------------------------------------------
 def ms_to_berlin_datetime(ms):
     """Converts epoch milliseconds (int, float, or string) to Europe/Berlin localized datetime."""
@@ -186,6 +186,28 @@ def get_pace_classification(termin):
     is_vollzeit = "vollzeit" in uform_name.lower() or "vollzeit" in title
     return is_vollzeit, uform_name, dauer_name
 
+def get_seats_status(termin):
+    """
+    Parses teilnehmerMin and teilnehmerMax to reproduce the Arbeitsagentur UI status:
+    Returns (status_text, is_fully_booked).
+    """
+    min_t = termin.get("teilnehmerMin")
+    max_t = termin.get("teilnehmerMax")
+
+    if min_t is not None and max_t is not None:
+        try:
+            min_val = int(min_t)
+            max_val = int(max_t)
+            if max_val > 0 and min_val >= max_val:
+                return f"{min_val}/{max_val} (belegt)", True
+            return f"{min_val}/{max_val}", False
+        except (ValueError, TypeError):
+            pass
+
+    if max_t:
+        return f"max. {max_t}", False
+    return None, False
+
 def is_specialized_course(termin):
     angebot = termin.get("angebot", {})
     titel = angebot.get("titel", "").lower()
@@ -220,7 +242,6 @@ def evaluate_termin(termin, allow_in_person: bool):
         titel = termin.get("angebot", {}).get("titel", "").lower()
         zeiten = (termin.get("unterrichtszeiten") or "").lower()
 
-        # Form ID 5 or 'e-learning' / 'virtuell' in bezeichnung
         is_virtual_form = (form_id == 5) or ("virtuell" in form_label) or ("e-learning" in form_label)
         is_hybrid_in_person = ("teilweise virtuell" in titel) or ("in präsenz" in zeiten)
         if not (is_virtual_form and not is_hybrid_in_person):
@@ -245,6 +266,7 @@ def send_ntfy_notification(termin, termin_id, category):
 
     city = termin.get("adresse", {}).get("ortStrasse", {}).get("name", "N/A")
     is_vollzeit, pace_label, dauer_label = get_pace_classification(termin)
+    seats_str, _ = get_seats_status(termin)
 
     zeiten_str = clean_html_text(termin.get("unterrichtszeiten"))
     notes_str = clean_html_text(termin.get("bemerkungZeit"))
@@ -256,8 +278,10 @@ def send_ntfy_notification(termin, termin_id, category):
         f"Schule: {provider}",
         f"Ort: {city}",
         f"Unterrichtsform: {pace_label} ({dauer_label})",
-        f"Zeiten: {zeiten_str}",
     ]
+    if seats_str:
+        message_lines.append(f"Teilnehmer: {seats_str}")
+    message_lines.append(f"Zeiten: {zeiten_str}")
     if notes_str and notes_str != "N/A":
         message_lines.append(f"Hinweise: {notes_str}")
     message_lines.extend([
@@ -313,7 +337,7 @@ def write_github_summary(stats, all_matched_items):
 
     if all_matched_items:
         markdown.append("### Active Qualifying Courses\n")
-        markdown.append("| Status & Mode | Course & School | Pace & Duration | Dates & Deadline | Schedule & Notes |")
+        markdown.append("| Status & Category | Course & School | Format & Dauer | Dates & Deadline | Schedule & Notes |")
         markdown.append("| :---: | :--- | :--- | :--- | :--- |")
 
         # Newly alerted courses first, then cached, both chronologically by start date
@@ -325,7 +349,7 @@ def write_github_summary(stats, all_matched_items):
         )
 
         for item in all_matched_items:
-            # 1. Status & Mode (using <sub> for the update timestamp)
+            # 1. Status & Category
             badge = "🔔 **New**" if item["is_new"] else "✓ Cached"
             icon = "📍" if "Berlin" in item["category"] else "🌐"
             stand_str = (
@@ -337,19 +361,24 @@ def write_github_summary(stats, all_matched_items):
             if stand_str:
                 status_col += f"<br>{stand_str}"
 
-            # 2. Course & School (Provider & Location in <sub>)
+            # 2. Course & School (School + Location in subscript)
             title_esc = escape_markdown_cell(item["title"])
             prov_esc = escape_markdown_cell(item["provider"])
             city_esc = escape_markdown_cell(item["city"])
             course_col = f"[**{title_esc}**]({item['link']})<br><sub>🏫 {prov_esc} • 📍 {city_esc}</sub>"
 
-            # 3. Pace & Duration (Duration in <sub>)
+            # 3. Format & Dauer (clean text, bold for Vollzeit, seats status)
             pace_label_esc = escape_markdown_cell(item["pace_label"])
-            pace_badge = f"⚡ **{pace_label_esc}**" if item["is_vollzeit"] else pace_label_esc
+            pace_badge = f"**{pace_label_esc}**" if item["is_vollzeit"] else pace_label_esc
             dauer_esc = escape_markdown_cell(item["dauer"])
-            pace_col = f"{pace_badge}<br><sub>{dauer_esc}</sub>"
+            seats_badge = (
+                f"<br><sub>👥 {escape_markdown_cell(item['seats'])}</sub>"
+                if item.get("seats")
+                else ""
+            )
+            format_col = f"{pace_badge}<br><sub>{dauer_esc}</sub>{seats_badge}"
 
-            # 4. Dates & Deadline (Deadline in <sub>)
+            # 4. Dates & Deadline
             dur_str = f"🗓️ {item['start']} – {item['end']}"
             dead_str = (
                 f"<sub>⏳ Anm.: {item['deadline']}</sub>"
@@ -358,16 +387,13 @@ def write_github_summary(stats, all_matched_items):
             )
             dates_col = f"{dur_str}<br>{dead_str}"
 
-            # 5. Schedule & Notes (Notes in <sub><em>...</em></sub>)
+            # 5. Schedule & Notes
             sched_esc = escape_markdown_cell(item["schedule"])
             notes_esc = escape_markdown_cell(item["notes"]) if item["notes"] != "N/A" else ""
-            if notes_esc:
-                sched_col = f"{sched_esc}<br><sub>📌 <em>{notes_esc}</em></sub>"
-            else:
-                sched_col = sched_esc
+            sched_col = f"{sched_esc}<br><sub>📌 <em>{notes_esc}</em></sub>" if notes_esc else sched_esc
 
             markdown.append(
-                f"| {status_col} | {course_col} | {pace_col} | {dates_col} | {sched_col} |"
+                f"| {status_col} | {course_col} | {format_col} | {dates_col} | {sched_col} |"
             )
     else:
         markdown.append("> *No matching course offerings currently available.*\n")
@@ -474,6 +500,7 @@ def main():
                     updated_dt = ms_to_berlin_datetime(t.get("aktualisierungsdatum"))
 
                     is_vollzeit, pace_label, dauer_name = get_pace_classification(t)
+                    seats_str, _ = get_seats_status(t)
                     angebot = t.get("angebot", {})
 
                     all_matched_items.append({
@@ -485,6 +512,7 @@ def main():
                         "is_vollzeit": is_vollzeit,
                         "pace_label": pace_label,
                         "dauer": dauer_name,
+                        "seats": seats_str,
                         "schedule": clean_html_text(t.get("unterrichtszeiten")),
                         "notes": clean_html_text(t.get("bemerkungZeit")),
                         "start": start_dt.strftime("%d.%m.%Y") if start_dt else "N/A",
