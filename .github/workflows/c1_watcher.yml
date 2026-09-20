@@ -17,6 +17,8 @@ concurrency:
 jobs:
   run-watcher:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
 
     env:
       MIN_START_DATE: ${{ inputs.min_start_date || vars.MIN_START_DATE }}
