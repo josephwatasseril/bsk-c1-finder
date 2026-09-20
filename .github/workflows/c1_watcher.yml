@@ -70,7 +70,7 @@ jobs:
         run: |
           # Fetch all fx-state caches, sort by ID descending, skip the first 10, delete the rest
           gh api "/repos/$REPO/actions/caches?per_page=100" \
-            --jq '.actions_caches[] | select(.key | startswith("fx-state-")) | .id' \
+            --jq '.actions_caches[] | select(.key | startswith("c1-state-")) | .id' \
           | tail -n +11 \
           | while read -r cache_id; do
             echo "Deleting surplus cache ID: $cache_id"
